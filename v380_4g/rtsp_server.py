@@ -4,6 +4,8 @@ RTSP Server for V380 camera streams
 
 Provides live RTSP streaming of decrypted V380 video.
 Connect with: vlc rtsp://localhost:8554/stream
+        or:  mpv rtsp://localhost:8554/stream
+        or:  ffplay rtsp://localhost:8554/stream
 """
 
 import socket
@@ -22,6 +24,7 @@ class RTPPacketizer:
         self.sequence = random.randint(0, 0xFFFF)
         self.timestamp = random.randint(0, 0xFFFFFFFF)
         self.payload_type = 96
+        self._ts_origin = random.randint(0, 0xFFFFFFFF)
 
     def packetize_nal(self, nal_data: bytes, is_last: bool = True) -> list:
         """Convert a NAL unit to RTP packets"""
@@ -75,8 +78,16 @@ class RTPPacketizer:
         self.sequence = (self.sequence + 1) & 0xFFFF
         return header + payload
 
+    def set_timestamp_from_wallclock(self, wall_seconds: float):
+        """
+        Derive RTP timestamp from wall clock (90 kHz H.265 clock).
+        Call once per frame before packetizing so all packets in a
+        frame share the same timestamp and the sequence is monotonic.
+        """
+        self.timestamp = int(wall_seconds * 90000 + self._ts_origin) & 0xFFFFFFFF
+
     def advance_timestamp(self, ticks: int = 3600):
-        """Advance timestamp (90kHz clock)"""
+        """Advance timestamp by fixed ticks (legacy fallback)."""
         self.timestamp = (self.timestamp + ticks) & 0xFFFFFFFF
 
 
@@ -97,6 +108,7 @@ class RTSPServer:
         self.vps = None
         self.sps = None
         self.pps = None
+        self._last_frame_ts = 0          # for monotonic timestamp enforcement
 
     def start(self):
         """Start the RTSP server"""
@@ -117,10 +129,11 @@ class RTSPServer:
         if self.server_socket:
             self.server_socket.close()
         with self.lock:
-            for client_sock, rtp_sock, _, _ in self.clients:
+            for client in self.clients:
                 try:
-                    client_sock.close()
-                    rtp_sock.close()
+                    client['sock'].close()
+                    if client.get('rtp_sock'):
+                        client['rtp_sock'].close()
                 except:
                     pass
             self.clients.clear()
@@ -133,35 +146,102 @@ class RTSPServer:
         self.width = width
         self.height = height
 
+    def _classify_nals(self, nal_units: list) -> bool:
+        """
+        Cache VPS/SPS/PPS (types 32-34) from nal_units.
+        Returns True if an IDR slice (types 19/20) is present.
+        """
+        has_idr = False
+        for nal in nal_units:
+            if len(nal) < 2:
+                continue
+            nal_type = (nal[0] >> 1) & 0x3F
+            if nal_type == 32:
+                self.vps = nal
+            elif nal_type == 33:
+                self.sps = nal
+            elif nal_type == 34:
+                self.pps = nal
+            elif nal_type in (19, 20):
+                has_idr = True
+        return has_idr
+
+    # Minimum RTP timestamp increment between frames.
+    # 90000 / 25 = 3600 ticks ≈ 25 fps.  This prevents burst-delivered frames
+    # (multiple frames returned by one recv() call) from receiving timestamps
+    # that are only 1 tick apart, which would imply an insane frame rate to
+    # the decoder.  Wall-clock values larger than this step are still used
+    # when the actual inter-frame gap is realistic.
+    _MIN_FRAME_TICKS = 3000   # ~30 fps lower-bound
+
+    def _next_rtp_timestamp(self) -> int:
+        """
+        Return a 90 kHz RTP timestamp for the current frame.
+        - Derived from the wall clock so long-term timing is accurate.
+        - Enforces a minimum step of _MIN_FRAME_TICKS so burst-delivered
+          frames are not given artificially close timestamps.
+        - Always strictly greater than the last issued value.
+        """
+        wall_ts = int(time.monotonic() * 90000) & 0xFFFFFFFF
+        diff = (wall_ts - self._last_frame_ts) & 0xFFFFFFFF
+        if diff >= self._MIN_FRAME_TICKS and diff < 0x80000000:
+            # Wall clock gave us a reasonable gap – use it.
+            ts = wall_ts
+        else:
+            # Either a burst arrival (diff too small) or a 32-bit wrap:
+            # advance by exactly the minimum step.
+            ts = (self._last_frame_ts + self._MIN_FRAME_TICKS) & 0xFFFFFFFF
+        self._last_frame_ts = ts
+        return ts
+
     def send_frame(self, frame_data: bytes):
-        """Send a video frame to all connected clients"""
-        if not self.clients:
+        """Send a decoded video frame to all connected clients."""
+        au_nals = self._parse_nal_units(frame_data)
+        if not au_nals:
             return
 
-        nal_units = self._parse_nal_units(frame_data)
+        # Cache param sets; detect IDR
+        has_idr = self._classify_nals(au_nals)
+
+        # Prepend cached param sets before IDR so the decoder always has them
+        if has_idr and self.vps and self.sps and self.pps:
+            filtered = [n for n in au_nals if (n[0] >> 1) & 0x3F not in (32, 33, 34)]
+            au_nals = [self.vps, self.sps, self.pps] + filtered
+
+        # One unique, strictly-monotonic timestamp per send_frame call
+        self.packetizer.timestamp = self._next_rtp_timestamp()
+
+        if not self.clients:
+            return
 
         with self.lock:
             dead_clients = []
 
-            for i, (client_sock, rtp_sock, client_addr, rtp_port) in enumerate(self.clients):
+            for i, client in enumerate(self.clients):
                 try:
-                    for j, nal in enumerate(nal_units):
-                        is_last = (j == len(nal_units) - 1)
+                    for j, nal in enumerate(au_nals):
+                        is_last = (j == len(au_nals) - 1)
                         packets = self.packetizer.packetize_nal(nal, is_last)
                         for packet in packets:
-                            rtp_sock.sendto(packet, (client_addr[0], rtp_port))
+                            if client['tcp']:
+                                # RFC 2326 §10.12 interleaved binary data:
+                                # $ + 1-byte channel + 2-byte big-endian length + RTP data
+                                interleave = struct.pack('>BBH', 0x24, client['interleaved_channel'], len(packet))
+                                client['sock'].sendall(interleave + packet)
+                            else:
+                                client['rtp_sock'].sendto(packet, (client['addr'][0], client['rtp_port']))
                 except Exception:
                     dead_clients.append(i)
 
             for i in reversed(dead_clients):
                 try:
-                    self.clients[i][0].close()
-                    self.clients[i][1].close()
+                    self.clients[i]['sock'].close()
+                    if self.clients[i].get('rtp_sock'):
+                        self.clients[i]['rtp_sock'].close()
                 except:
                     pass
                 self.clients.pop(i)
 
-        self.packetizer.advance_timestamp(3600)
 
     def _parse_nal_units(self, data: bytes) -> list:
         """Parse NAL units from Annex B format"""
@@ -218,13 +298,29 @@ class RTSPServer:
         """Handle RTSP client requests"""
         rtp_sock = None
         rtp_port = None
+        use_tcp = False
+        interleaved_channel = 0
+        playing = False
 
         try:
             while self.running:
-                client_sock.settimeout(30.0)
-                data = client_sock.recv(4096)
-                if not data:
-                    break
+                if playing:
+                    # After PLAY, the connection stays open indefinitely so the
+                    # client can send TEARDOWN.  Use a long timeout and treat a
+                    # timeout as "still alive" — only a real recv error or an
+                    # empty read (connection closed) should end the session.
+                    client_sock.settimeout(60.0)
+                    try:
+                        data = client_sock.recv(4096)
+                    except socket.timeout:
+                        continue   # client is alive, just not sending anything
+                    if not data:
+                        break
+                else:
+                    client_sock.settimeout(30.0)
+                    data = client_sock.recv(4096)
+                    if not data:
+                        break
 
                 request = data.decode('utf-8', errors='ignore')
                 lines = request.split('\r\n')
@@ -253,23 +349,44 @@ class RTSPServer:
                     client_sock.send(response.encode())
 
                 elif method == 'SETUP':
-                    transport = self._get_header(lines, 'Transport') or ''
+                    transport_hdr = self._get_header(lines, 'Transport') or ''
 
-                    rtp_port = 0
-                    for part in transport.split(';'):
-                        if part.startswith('client_port='):
-                            ports = part.split('=')[1]
-                            rtp_port = int(ports.split('-')[0])
-                            break
+                    # Detect TCP interleaved vs UDP — must echo back what client requested
+                    if 'RTP/AVP/TCP' in transport_hdr or 'interleaved' in transport_hdr:
+                        # TCP interleaved mode (ffplay/mpv default when forced with -rtsp_transport tcp)
+                        use_tcp = True
+                        interleaved_channel = 0
+                        for part in transport_hdr.split(';'):
+                            if part.startswith('interleaved='):
+                                try:
+                                    interleaved_channel = int(part.split('=')[1].split('-')[0])
+                                except ValueError:
+                                    pass
+                        transport_reply = f'RTP/AVP/TCP;unicast;interleaved={interleaved_channel}-{interleaved_channel+1}'
+                    else:
+                        # UDP mode — must bind the socket first to get a real OS-assigned port
+                        use_tcp = False
+                        rtp_port = 0
+                        for part in transport_hdr.split(';'):
+                            if part.startswith('client_port='):
+                                try:
+                                    rtp_port = int(part.split('=')[1].split('-')[0])
+                                except ValueError:
+                                    pass
 
-                    if rtp_port == 0:
-                        rtp_port = 5000
+                        if rtp_port == 0:
+                            rtp_port = 5000
 
-                    rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    server_rtp_port = rtp_sock.getsockname()[1] or 6970
+                        rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        rtp_sock.bind(('0.0.0.0', 0))           # bind to get a real port
+                        server_rtp_port = rtp_sock.getsockname()[1]  # now non-zero
+                        transport_reply = (
+                            f'RTP/AVP;unicast;client_port={rtp_port}-{rtp_port+1}'
+                            f';server_port={server_rtp_port}-{server_rtp_port+1}'
+                        )
 
                     response = self._make_response(200, cseq, {
-                        'Transport': f'RTP/AVP;unicast;client_port={rtp_port}-{rtp_port+1};server_port={server_rtp_port}-{server_rtp_port+1}',
+                        'Transport': transport_reply,
                         'Session': self.session_id
                     })
                     client_sock.send(response.encode())
@@ -281,10 +398,18 @@ class RTSPServer:
                     })
                     client_sock.send(response.encode())
 
-                    if rtp_sock and rtp_port:
-                        with self.lock:
-                            self.clients.append((client_sock, rtp_sock, client_addr, rtp_port))
-                        print(f"[RTSP] Streaming to {client_addr[0]}:{rtp_port}")
+                    with self.lock:
+                        self.clients.append({
+                            'sock': client_sock,
+                            'rtp_sock': rtp_sock if not use_tcp else None,
+                            'addr': client_addr,
+                            'rtp_port': rtp_port,
+                            'tcp': use_tcp,
+                            'interleaved_channel': interleaved_channel,
+                        })
+                    mode = f"TCP interleaved ch={interleaved_channel}" if use_tcp else f"UDP port={rtp_port}"
+                    print(f"[RTSP] Streaming to {client_addr[0]} via {mode}")
+                    playing = True
 
                 elif method == 'TEARDOWN':
                     response = self._make_response(200, cseq, {
@@ -297,8 +422,7 @@ class RTSPServer:
             print(f"[RTSP] Client error: {e}")
         finally:
             with self.lock:
-                self.clients = [(cs, rs, ca, rp) for cs, rs, ca, rp in self.clients
-                               if cs != client_sock]
+                self.clients = [c for c in self.clients if c['sock'] != client_sock]
             try:
                 client_sock.close()
                 if rtp_sock:
@@ -369,7 +493,10 @@ if __name__ == '__main__':
     server = RTSPServer(args.port)
     server.start()
 
-    print(f"RTSP server running. Connect with: vlc rtsp://localhost:{args.port}/stream")
+    print(f"RTSP server running. Connect with:")
+    print(f"  vlc  rtsp://localhost:{args.port}/stream")
+    print(f"  mpv  rtsp://localhost:{args.port}/stream")
+    print(f"  ffplay rtsp://localhost:{args.port}/stream")
     print("Press Ctrl+C to stop")
 
     try:

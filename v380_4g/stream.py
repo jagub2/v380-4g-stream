@@ -2,6 +2,8 @@
 V380 Live Streaming
 
 Stream and decrypt live video/audio from V380 cameras.
+Supports dashcam-style continuous recording: saves rolling MP4 segments
+of fixed duration while streaming without interruption.
 """
 
 import struct
@@ -9,24 +11,77 @@ import socket
 import signal
 import time
 import os
+import threading
 from datetime import datetime
 from typing import Optional, Tuple
 
 from .client import V380Client
 from .crypto import decrypt_64_80, decrypt_audio
+from .mp4_muxer import MP4Muxer
 
 # Global flag for Ctrl-C handling
-_stop_recording = False
+_stop_streaming = False
 
 
 def _signal_handler(sig, frame):
-    global _stop_recording
-    _stop_recording = True
-    print("\n[!] Ctrl-C detected - stopping recording...")
+    global _stop_streaming
+    _stop_streaming = True
+    print("\n[!] Ctrl-C detected - stopping stream...")
+
+
+class _Segment:
+    """
+    Collects raw H.265 / AAC data for one dashcam segment.
+    Closed and handed off to a background muxer thread when the
+    segment duration elapses.
+    """
+
+    def __init__(self, h265_path: str, aac_path: Optional[str]):
+        self.h265_path = h265_path
+        self.aac_path = aac_path
+        self.start_time = time.time()
+        self._h265_f = open(h265_path, 'wb')
+        self._aac_f = open(aac_path, 'wb') if aac_path else None
+
+    def write_video(self, data: bytes):
+        self._h265_f.write(data)
+
+    def write_audio(self, data: bytes):
+        if self._aac_f:
+            self._aac_f.write(data)
+
+    def close(self) -> float:
+        """Close files and return elapsed seconds for this segment."""
+        elapsed = time.time() - self.start_time
+        self._h265_f.close()
+        if self._aac_f:
+            self._aac_f.close()
+        return elapsed
+
+    def mux_to_mp4(self, mp4_path: str, elapsed: float):
+        """Mux raw streams to MP4. Runs in a background thread."""
+        audio_path = self.aac_path if (self.aac_path and os.path.getsize(self.aac_path) > 0) else None
+        muxer = MP4Muxer(
+            video_path=self.h265_path,
+            audio_path=audio_path,
+            duration_seconds=elapsed,
+        )
+        ok = muxer.mux(mp4_path)
+        # Clean up raw intermediates
+        try:
+            os.remove(self.h265_path)
+            if self.aac_path:
+                os.remove(self.aac_path)
+        except OSError:
+            pass
+        if ok:
+            print(f"[+] Saved segment: {mp4_path}")
+        else:
+            print(f"[!] Muxing failed for segment: {mp4_path}")
 
 
 class StreamRecorder:
-    """Record live video/audio streams from V380 camera"""
+    """Stream and record live video/audio from V380 camera"""
 
     HEADER_SIZE = 12
     KEEPALIVE_PACKET = bytes.fromhex("01210000000000000010000000000000")
@@ -42,129 +97,139 @@ class StreamRecorder:
         self._current_is_iframe = False
 
     def record(self, duration: int = 60, output_dir: str = "recordings",
-               output_prefix: str = "v380", rtsp_server=None) -> Optional[str]:
+               output_prefix: str = "v380", rtsp_server=None) -> None:
         """
-        Record video stream for specified duration.
+        Stream continuously, saving rolling MP4 segments of `duration` seconds.
+
+        Like a dashcam: each segment is muxed to MP4 in the background while
+        the next segment is already being recorded. No frames are lost between
+        segments.
 
         Args:
-            duration: Recording duration in seconds
-            output_dir: Directory for output files (created if needed)
-            output_prefix: Prefix for output filenames
-            rtsp_server: Optional RTSP server for live streaming
-
-        Returns:
-            Path to recorded .h265 file, or None on failure
+            duration:      Length of each MP4 segment in seconds.
+            output_dir:    Directory for output files (created if needed).
+            output_prefix: Filename prefix, e.g. "v380" → "v380_20250101_120000.mp4".
+            rtsp_server:   Optional RTSP server for simultaneous live viewing.
         """
         stream_sock = self.client.create_stream_socket()
         if not stream_sock:
             return None
 
-        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        video_file = os.path.join(output_dir, f"{output_prefix}_{timestamp}.h265")
 
         record_audio = self.client.audio_supported and self.enable_audio
-        audio_file = video_file.replace('.h265', '.aac') if record_audio else None
-
-        print(f"[*] Recording video to {video_file}")
         if record_audio:
-            print(f"[*] Recording audio to {audio_file}")
+            print("[*] Audio: enabled")
         elif not self.client.audio_supported:
-            print(f"[*] Audio: not supported by camera")
+            print("[*] Audio: not supported by camera")
         else:
-            print(f"[*] Audio: disabled")
+            print("[*] Audio: disabled by user")
 
-        # Debug raw stream
-        raw_file = video_file.replace('.h265', '_raw.bin') if self.client.debug else None
-        if raw_file:
-            print(f"[*] Saving raw stream to {raw_file}")
+        print(f"[*] Recording {duration}s segments to {output_dir}/")
+        print("[*] Press Ctrl-C to stop")
 
-        # Set up signal handler
-        global _stop_recording
-        _stop_recording = False
+        global _stop_streaming
+        _stop_streaming = False
         old_handler = signal.signal(signal.SIGINT, _signal_handler)
 
-        start_time = time.time()
-        video_bytes = 0
-        audio_bytes = 0
+        def new_segment() -> _Segment:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            h265 = os.path.join(output_dir, f".{output_prefix}_{ts}.h265")
+            aac  = os.path.join(output_dir, f".{output_prefix}_{ts}.aac") if record_audio else None
+            return _Segment(h265, aac)
+
+        def close_and_mux(seg: _Segment):
+            elapsed = seg.close()
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            mp4 = os.path.join(output_dir, f"{output_prefix}_{ts}.mp4")
+            t = threading.Thread(target=seg.mux_to_mp4, args=(mp4, elapsed), daemon=True)
+            t.start()
+
+        segment = new_segment()
+        segment_start = time.time()
+
+        total_video_bytes = 0
+        total_audio_bytes = 0
+        session_start = time.time()
+        last_keepalive = time.time()
+        last_progress = time.time()
         buffer = bytearray()
 
         try:
-            video_f = open(video_file, 'wb')
-            audio_f = open(audio_file, 'wb') if record_audio else None
-            raw_f = open(raw_file, 'wb') if raw_file else None
+            while not _stop_streaming:
+                try:
+                    data = stream_sock.recv(65536)
+                    if not data:
+                        print("[!] Stream closed by server")
+                        break
 
-            try:
-                while (time.time() - start_time) < duration and not _stop_recording:
-                    try:
-                        data = stream_sock.recv(65536)
-                        if not data:
-                            break
+                    buffer.extend(data)
 
-                        buffer.extend(data)
+                    video, audio, remaining = self._process_stream_data(
+                        bytes(buffer), record_audio, rtsp_server
+                    )
+                    buffer = bytearray(remaining)
 
-                        if raw_f:
-                            raw_f.write(data)
+                    if video:
+                        segment.write_video(video)
+                        total_video_bytes += len(video)
 
-                        video, audio, remaining = self._process_stream_data(
-                            bytes(buffer), record_audio
-                        )
-                        buffer = bytearray(remaining)
+                    if audio:
+                        segment.write_audio(audio)
+                        total_audio_bytes += len(audio)
 
-                        if video:
-                            video_f.write(video)
-                            video_bytes += len(video)
-                            if rtsp_server:
-                                rtsp_server.send_frame(video)
+                    now = time.time()
 
-                        if audio and audio_f:
-                            audio_f.write(audio)
-                            audio_bytes += len(audio)
+                    # Roll over to a new segment when duration elapses
+                    if now - segment_start >= duration:
+                        close_and_mux(segment)
+                        segment = new_segment()
+                        segment_start = now
 
-                        # Periodic keepalive
-                        if int(time.time()) % 5 == 0:
-                            stream_sock.sendall(self.KEEPALIVE_PACKET)
-
-                        # Progress update
-                        elapsed = time.time() - start_time
-                        total = video_bytes + audio_bytes
-                        if total % 50000 < 5000:
-                            if record_audio:
-                                print(f"  {elapsed:.0f}s - Video: {video_bytes/1024:.1f}KB, Audio: {audio_bytes/1024:.1f}KB")
-                            else:
-                                print(f"  {elapsed:.0f}s - Video: {video_bytes/1024:.1f}KB")
-
-                    except socket.timeout:
+                    # Keepalive every 5 s
+                    if now - last_keepalive >= 5:
                         stream_sock.sendall(self.KEEPALIVE_PACKET)
+                        last_keepalive = now
 
-            finally:
-                video_f.close()
-                if audio_f:
-                    audio_f.close()
-                if raw_f:
-                    raw_f.close()
+                    # Progress every 10 s
+                    if now - last_progress >= 10:
+                        elapsed = now - session_start
+                        seg_elapsed = now - segment_start
+                        if record_audio:
+                            print(f"  {elapsed:.0f}s total | segment {seg_elapsed:.0f}/{duration}s"
+                                  f" | video {total_video_bytes/1024:.0f} KB"
+                                  f" | audio {total_audio_bytes/1024:.0f} KB")
+                        else:
+                            print(f"  {elapsed:.0f}s total | segment {seg_elapsed:.0f}/{duration}s"
+                                  f" | video {total_video_bytes/1024:.0f} KB")
+                        last_progress = now
+
+                except socket.timeout:
+                    stream_sock.sendall(self.KEEPALIVE_PACKET)
+                    last_keepalive = time.time()
 
         except Exception as e:
             print(f"[!] Stream error: {e}")
             if self.client.debug:
                 import traceback
                 traceback.print_exc()
-            return None
 
         finally:
+            # Flush the current (incomplete) segment
+            print("[*] Flushing final segment...")
+            close_and_mux(segment)
             signal.signal(signal.SIGINT, old_handler)
             stream_sock.close()
 
-        status = "stopped by user" if _stop_recording else "complete"
-        print(f"\n[+] Recording {status}!")
-        print(f"    Video: {video_bytes/1024:.1f} KB -> {video_file}")
-        if record_audio:
-            print(f"    Audio: {audio_bytes/1024:.1f} KB -> {audio_file}")
+        elapsed = time.time() - session_start
+        print(f"[+] Session ended after {elapsed:.0f}s")
 
-        return video_file
+    # ------------------------------------------------------------------
+    # Internal stream processing (unchanged from original)
+    # ------------------------------------------------------------------
 
-    def _process_stream_data(self, data: bytes, record_audio: bool) -> Tuple[bytes, bytes, bytes]:
+    def _process_stream_data(self, data: bytes, record_audio: bool,
+                             rtsp_server=None) -> Tuple[bytes, bytes, bytes]:
         """Process and decrypt stream packets"""
         video_result = bytearray()
         audio_result = bytearray()
@@ -178,9 +243,9 @@ class StreamRecorder:
 
                 is_iframe = (data[pos+1] == 0x28)
                 total_frame = struct.unpack('<H', data[pos+3:pos+5])[0]
-                cur_frame = struct.unpack('<H', data[pos+5:pos+7])[0]
-                pkt_len = struct.unpack('<H', data[pos+7:pos+9])[0]
-                packet_end = pos + self.HEADER_SIZE + pkt_len
+                cur_frame   = struct.unpack('<H', data[pos+5:pos+7])[0]
+                pkt_len     = struct.unpack('<H', data[pos+7:pos+9])[0]
+                packet_end  = pos + self.HEADER_SIZE + pkt_len
 
                 if packet_end > len(data):
                     break
@@ -188,7 +253,7 @@ class StreamRecorder:
                 payload = data[pos+12:packet_end]
 
                 if cur_frame == 0:
-                    # Process previous complete frame
+                    # Flush any previously assembled complete frame
                     if self._current_frame_start is not None and 'current' in self._frame_chunks:
                         if len(self._frame_chunks['current']) >= self._current_total:
                             decrypted = self._decrypt_frame(
@@ -196,6 +261,8 @@ class StreamRecorder:
                                 self._current_is_iframe
                             )
                             video_result.extend(decrypted)
+                            if rtsp_server:
+                                rtsp_server.send_frame(decrypted)
                         self._frame_chunks.pop('current', None)
 
                     # Start new frame
@@ -213,6 +280,8 @@ class StreamRecorder:
                                 self._current_is_iframe
                             )
                             video_result.extend(decrypted)
+                            if rtsp_server:
+                                rtsp_server.send_frame(decrypted)
                             self._frame_chunks.pop('current', None)
                             self._current_frame_start = None
 
@@ -224,9 +293,9 @@ class StreamRecorder:
                     break
 
                 total_frame = struct.unpack('<H', data[pos+3:pos+5])[0]
-                cur_frame = struct.unpack('<H', data[pos+5:pos+7])[0]
-                pkt_len = struct.unpack('<H', data[pos+7:pos+9])[0]
-                packet_end = pos + self.HEADER_SIZE + pkt_len
+                cur_frame   = struct.unpack('<H', data[pos+5:pos+7])[0]
+                pkt_len     = struct.unpack('<H', data[pos+7:pos+9])[0]
+                packet_end  = pos + self.HEADER_SIZE + pkt_len
 
                 # Sanity check for false audio headers
                 if pkt_len > 1000 or total_frame > 10 or packet_end > len(data):
@@ -248,7 +317,7 @@ class StreamRecorder:
             else:
                 pos += 1
 
-        # Process any remaining complete frame
+        # Flush any remaining complete frame
         if self._current_frame_start is not None and 'current' in self._frame_chunks:
             if len(self._frame_chunks['current']) >= self._current_total:
                 decrypted = self._decrypt_frame(
@@ -256,6 +325,8 @@ class StreamRecorder:
                     self._current_is_iframe
                 )
                 video_result.extend(decrypted)
+                if rtsp_server:
+                    rtsp_server.send_frame(decrypted)
                 self._frame_chunks.pop('current', None)
                 self._current_frame_start = None
 
@@ -265,7 +336,6 @@ class StreamRecorder:
         """Decrypt and reassemble video frame"""
         chunks.sort(key=lambda x: x[0])
 
-        # Reassemble frame data
         frame_data = bytearray()
         for cur_frame, payload in chunks:
             if cur_frame == 0:
@@ -273,7 +343,6 @@ class StreamRecorder:
             else:
                 frame_data.extend(payload)
 
-        # Decrypt based on frame type and size
         if is_iframe or len(frame_data) >= 64:
             return decrypt_64_80(bytes(frame_data), self.client.cipher)
         else:
