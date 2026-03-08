@@ -25,3 +25,5 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+v380.env

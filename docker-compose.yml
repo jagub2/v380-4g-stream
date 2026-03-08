@@ -1,0 +1,12 @@
+services:
+  v380-4g-stream:
+    build: ./
+    container_name: v380-4g-stream
+    env_file:
+      - v380.env
+    ports:
+      - 8554:8554
+    volumes:
+      - ./recordings:/app/recordings
+    restart: unless-stopped
+
