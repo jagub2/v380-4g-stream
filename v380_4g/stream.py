@@ -97,7 +97,8 @@ class StreamRecorder:
         self._current_is_iframe = False
 
     def record(self, duration: int = 60, output_dir: str = "recordings",
-               output_prefix: str = "v380", rtsp_server=None) -> None:
+               output_prefix: str = "v380", rtsp_server=None,
+               total_duration: Optional[int] = None) -> None:
         """
         Stream continuously, saving rolling MP4 segments of `duration` seconds.
 
@@ -106,10 +107,13 @@ class StreamRecorder:
         segments.
 
         Args:
-            duration:      Length of each MP4 segment in seconds.
-            output_dir:    Directory for output files (created if needed).
-            output_prefix: Filename prefix, e.g. "v380" → "v380_20250101_120000.mp4".
-            rtsp_server:   Optional RTSP server for simultaneous live viewing.
+            duration:       Length of each MP4 segment in seconds.
+            output_dir:     Directory for output files (created if needed).
+            output_prefix:  Filename prefix, e.g. "v380" → "v380_20250101_120000.mp4".
+            rtsp_server:    Optional RTSP server for simultaneous live viewing.
+            total_duration: Total recording cap in seconds. Stream stops
+                            automatically after this many seconds (in addition
+                            to Ctrl-C). None = record indefinitely.
         """
         stream_sock = self.client.create_stream_socket()
         if not stream_sock:
@@ -185,6 +189,11 @@ class StreamRecorder:
                         close_and_mux(segment)
                         segment = new_segment()
                         segment_start = now
+
+                    # Stop if total recording cap reached
+                    if total_duration is not None and now - session_start >= total_duration:
+                        print(f"\n[*] Reached total duration limit ({total_duration}s) — stopping")
+                        _stop_streaming = True
 
                     # Keepalive every 5 s
                     if now - last_keepalive >= 5:

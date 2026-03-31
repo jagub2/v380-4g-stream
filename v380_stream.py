@@ -14,7 +14,7 @@ import sys
 import os
 
 from v380_4g import __version__
-from v380_4g.client import V380Client
+from v380_4g.client import V380Client, DEFAULT_API_SERVER, discover_stream_server
 from v380_4g.stream import StreamRecorder
 
 
@@ -46,11 +46,20 @@ Press Ctrl-C to stop recording early.
                          help="Device password (NOT your account password)")
 
     parser.add_argument("--duration", "-t", type=int, default=60, metavar="SECS",
-                       help="Recording duration in seconds (default: 60)")
+                       help="Segment duration in seconds (default: 60). "
+                            "Use --segment-mins for minutes.")
+    parser.add_argument("--segment-mins", type=float, metavar="MINS",
+                       help="Segment duration in minutes (overrides --duration)")
+    parser.add_argument("--total-mins", type=float, metavar="MINS",
+                       help="Total recording time in minutes, then stop automatically"
+                            " (default: record indefinitely until Ctrl-C)")
     parser.add_argument("--output-dir", "-o", default="recordings", metavar="DIR",
                        help="Output directory (default: recordings)")
     parser.add_argument("--server", metavar="IP",
                        help="Override API server IP")
+    parser.add_argument("--auto-server", action="store_true",
+                       help="Auto-discover closest server via MQTT dispatch "
+                            "(lower latency than the default hardcoded IP)")
     parser.add_argument("--handle", type=int, metavar="NUM",
                        help="Override encryption handle")
     parser.add_argument("--no-audio", action="store_true",
@@ -73,10 +82,22 @@ Press Ctrl-C to stop recording early.
 
     args = parser.parse_args()
 
+    # Resolve server IP
+    server = None
+    if args.server:
+        server = args.server
+    elif args.auto_server:
+        print(f"[*] Discovering closest streaming server for device {args.device_id}...")
+        server = discover_stream_server(args.device_id)
+        if server:
+            print(f"[+] Using server: {server}")
+        else:
+            print(f"[!] Discovery failed — falling back to {DEFAULT_API_SERVER}")
+
     # Create client
     client_kwargs = {"debug": args.debug}
-    if args.server:
-        client_kwargs["server"] = args.server
+    if server:
+        client_kwargs["server"] = server
 
     client = V380Client(args.device_id, args.password, **client_kwargs)
 
@@ -108,12 +129,22 @@ Press Ctrl-C to stop recording early.
             except Exception as e:
                 print(f"[!] Failed to start RTSP server: {e}")
 
+        # Resolve segment duration
+        segment_secs = int(args.segment_mins * 60) if args.segment_mins else args.duration
+        total_secs   = int(args.total_mins * 60)   if args.total_mins   else None
+
+        if args.segment_mins:
+            print(f"[*] Segment duration: {args.segment_mins:.1f} min ({segment_secs}s)")
+        if args.total_mins:
+            print(f"[*] Total recording:  {args.total_mins:.1f} min ({total_secs}s)")
+
         # Record stream
         recorder = StreamRecorder(client, enable_audio=not args.no_audio)
         video_file = recorder.record(
-            duration=args.duration,
+            duration=segment_secs,
             output_dir=args.output_dir,
-            rtsp_server=rtsp_server
+            rtsp_server=rtsp_server,
+            total_duration=total_secs,
         )
 
         # Stop RTSP

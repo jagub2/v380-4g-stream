@@ -485,17 +485,21 @@ class MP4Muxer:
         data.append(0x0F)
         data.append(3)
 
-        data.append(0x20 | 32)
+        # Array type byte: bit7=array_completeness(1), bit6=reserved(0), bits5:0=nal_unit_type
+        # array_completeness=1 (0x80) means all parameter sets are here, none in-band.
+        # Using 0x20 (array_completeness=0) causes strict decoders like mpv to ignore
+        # these arrays and then fail with "VPS/SPS/PPS does not exist".
+        data.append(0x80 | 32)   # VPS
         data.extend(struct.pack('>H', 1))
         data.extend(struct.pack('>H', len(vps)))
         data.extend(vps)
 
-        data.append(0x20 | 33)
+        data.append(0x80 | 33)   # SPS
         data.extend(struct.pack('>H', 1))
         data.extend(struct.pack('>H', len(sps)))
         data.extend(sps)
 
-        data.append(0x20 | 34)
+        data.append(0x80 | 34)   # PPS
         data.extend(struct.pack('>H', 1))
         data.extend(struct.pack('>H', len(pps)))
         data.extend(pps)

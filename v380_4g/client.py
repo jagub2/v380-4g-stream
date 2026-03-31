@@ -8,8 +8,10 @@ Handles authentication, session management, and JSON-RPC communication.
 import socket
 import struct
 import json
+import hashlib
 import secrets
 import time
+import urllib.request
 from typing import Optional
 from Crypto.Cipher import AES
 
@@ -20,6 +22,73 @@ DEFAULT_API_SERVER = "194.195.251.29"
 DEFAULT_API_PORT = 8089
 DEFAULT_REGISTER_PORT = 8900
 DEFAULT_STREAM_PORT = 8800
+
+# HTTP dispatch endpoint — returns streaming relay IPs ordered by proximity.
+# Confirmed from decompiled DispatchUtils.java.
+# POST dispatch.av380.net:8001/api/v1/get_stream_server
+# Response: {"code":2000,"data":[{"ip":"x.x.x.x","domain":"...","tp":{"call_port":N,"trans_port":N}}]}
+_DISPATCH_URL = "http://dispatch.av380.net:8001/api/v1/get_stream_server"
+_DISPATCH_SALT = "hsdata2022"
+
+
+def _sha1_hex(s: str) -> str:
+    return hashlib.sha1(s.encode()).hexdigest()
+
+
+def discover_stream_server(device_id: int, timeout: int = 5) -> Optional[str]:
+    """
+    Query the V380 HTTP dispatch server to find the closest streaming relay IP.
+
+    Posts to dispatch.av380.net:8001/api/v1/get_stream_server with the
+    device ID. Returns the first relay IP from the response, or None on failure
+    (caller should fall back to DEFAULT_API_SERVER).
+
+    Signing (from decompiled DispatchUtils.java):
+        canonical = f"dev_id={did}&platform={platform}&timestamp={ts}hsdata2022"
+        sign = SHA1(canonical)
+
+    Usage:
+        server = discover_stream_server(device_id) or DEFAULT_API_SERVER
+        client = V380Client(device_id, password, server=server)
+    """
+    ts = int(time.time())
+
+    # platform=10001 for legacy devices (non-IoT), 20001 for IoT.
+    # v380-4g-stream talks to legacy cameras so use 10001.
+    platform = 10001
+    canonical = f"dev_id={device_id}&platform={platform}&timestamp={ts}{_DISPATCH_SALT}"
+
+    payload = json.dumps({
+        "dev_id":    device_id,
+        "platform":  platform,
+        "timestamp": ts,
+        "sign":      _sha1_hex(canonical),
+    }, separators=(",", ":")).encode()
+
+    try:
+        req = urllib.request.Request(
+            _DISPATCH_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode()
+
+        data = json.loads(body)
+        if data.get("code") != 2000:
+            return None
+
+        entries = data.get("data") or []
+        if not entries:
+            return None
+
+        # Prefer domain over bare IP (more stable), fall back to IP
+        first = entries[0]
+        return first.get("domain") or first.get("ip") or None
+
+    except Exception:
+        return None
 
 
 class V380Client:
