@@ -96,6 +96,11 @@ class StreamRecorder:
         self._current_total = 0
         self._current_is_iframe = False
 
+        # Last seen VPS/SPS/PPS as complete Annex B bytes.
+        # Written at the start of every new segment so the muxer always
+        # has parameter sets even when rolling over mid-stream.
+        self._param_sets: bytes = b""
+
     def record(self, duration: int = 60, output_dir: str = "recordings",
                output_prefix: str = "v380", rtsp_server=None,
                total_duration: Optional[int] = None) -> None:
@@ -144,9 +149,28 @@ class StreamRecorder:
 
         def close_and_mux(seg: _Segment):
             elapsed = seg.close()
+            # Skip muxing if the segment has no actual video data.
+            # This happens when total_duration == segment duration: the
+            # rollover and stop check fire in the same iteration, creating
+            # a segment that only contains the param-set header (or nothing).
+            h265_size = os.path.getsize(seg.h265_path) if os.path.exists(seg.h265_path) else 0
+            param_only = len(self._param_sets) if self._param_sets else 0
+            if h265_size <= param_only:
+                # Nothing useful — clean up silently
+                try:
+                    os.remove(seg.h265_path)
+                    if seg.aac_path and os.path.exists(seg.aac_path):
+                        os.remove(seg.aac_path)
+                except OSError:
+                    pass
+                return
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             mp4 = os.path.join(output_dir, f"{output_prefix}_{ts}.mp4")
-            t = threading.Thread(target=seg.mux_to_mp4, args=(mp4, elapsed), daemon=True)
+            # Non-daemon so the process doesn't exit before muxing finishes.
+            # Tracked in mux_threads so record() can join them all before returning.
+            t = threading.Thread(target=seg.mux_to_mp4, args=(mp4, elapsed),
+                                 daemon=False)
+            mux_threads.append(t)
             t.start()
 
         segment = new_segment()
@@ -158,6 +182,7 @@ class StreamRecorder:
         last_keepalive = time.time()
         last_progress = time.time()
         buffer = bytearray()
+        mux_threads: list = []
 
         try:
             while not _stop_streaming:
@@ -175,6 +200,8 @@ class StreamRecorder:
                     buffer = bytearray(remaining)
 
                     if video:
+                        # Update cached VPS/SPS/PPS from this chunk of video data
+                        self._cache_param_sets(video)
                         segment.write_video(video)
                         total_video_bytes += len(video)
 
@@ -184,16 +211,23 @@ class StreamRecorder:
 
                     now = time.time()
 
-                    # Roll over to a new segment when duration elapses
-                    if now - segment_start >= duration:
-                        close_and_mux(segment)
-                        segment = new_segment()
-                        segment_start = now
-
-                    # Stop if total recording cap reached
+                    # Stop if total recording cap reached — check BEFORE
+                    # rollover so we don't create an empty segment then discard it.
                     if total_duration is not None and now - session_start >= total_duration:
                         print(f"\n[*] Reached total duration limit ({total_duration}s) — stopping")
                         _stop_streaming = True
+
+                    # Roll over to a new segment when duration elapses,
+                    # but only if we're not about to stop.
+                    if not _stop_streaming and now - segment_start >= duration:
+                        close_and_mux(segment)
+                        segment = new_segment()
+                        # Prepend cached parameter sets so the new segment is
+                        # self-contained and muxable regardless of where in
+                        # the GOP the rollover happened.
+                        if self._param_sets:
+                            segment.write_video(self._param_sets)
+                        segment_start = now
 
                     # Keepalive every 5 s
                     if now - last_keepalive >= 5:
@@ -232,6 +266,15 @@ class StreamRecorder:
 
         elapsed = time.time() - session_start
         print(f"[+] Session ended after {elapsed:.0f}s")
+
+        # Wait for all background mux threads to finish before returning.
+        # They are non-daemon threads, but joining explicitly ensures MP4
+        # files are fully written before the caller disconnects / exits.
+        pending = [t for t in mux_threads if t.is_alive()]
+        if pending:
+            print(f"[*] Waiting for {len(pending)} segment(s) to finish muxing...")
+            for t in pending:
+                t.join()
 
     # ------------------------------------------------------------------
     # Internal stream processing (unchanged from original)
@@ -356,3 +399,89 @@ class StreamRecorder:
             return decrypt_64_80(bytes(frame_data), self.client.cipher)
         else:
             return bytes(frame_data)
+
+    def _cache_param_sets(self, video: bytes):
+        """
+        Scan Annex B video bytes for VPS/SPS/PPS NAL units (types 32/33/34)
+        and update self._param_sets so they can be prepended to new segments.
+        """
+        START4 = b'\x00\x00\x00\x01'
+        START3 = b'\x00\x00\x01'
+
+        found = {}   # nal_type -> nalu_bytes (without start code)
+
+        i = 0
+        while i < len(video) - 4:
+            if video[i:i+4] == START4:
+                start = i + 4
+                i += 4
+            elif video[i:i+3] == START3:
+                start = i + 3
+                i += 3
+            else:
+                i += 1
+                continue
+
+            if start >= len(video):
+                break
+
+            nal_type = (video[start] >> 1) & 0x3F
+            if nal_type not in (32, 33, 34):   # VPS, SPS, PPS only
+                i = start
+                continue
+
+            # Find the end of this NALU
+            end = len(video)
+            j = start + 1
+            while j < len(video) - 3:
+                if video[j:j+4] == START4 or video[j:j+3] == START3:
+                    end = j
+                    break
+                j += 1
+
+            found[nal_type] = video[start:end]
+            i = end
+
+        if not found:
+            return
+
+        # Rebuild _param_sets in canonical order: VPS → SPS → PPS
+        buf = bytearray()
+        for nal_type in (32, 33, 34):
+            # Use freshly found NALU, or keep existing one
+            if nal_type in found:
+                buf += START4 + found[nal_type]
+            elif self._param_sets:
+                # Try to preserve existing param set for this type
+                existing = self._extract_one_param_set(self._param_sets, nal_type)
+                if existing:
+                    buf += START4 + existing
+
+        if buf:
+            self._param_sets = bytes(buf)
+
+    @staticmethod
+    def _extract_one_param_set(data: bytes, nal_type: int) -> bytes:
+        """Extract a single NALU of the given type from an Annex B byte string."""
+        START4 = b'\x00\x00\x00\x01'
+        START3 = b'\x00\x00\x01'
+        i = 0
+        while i < len(data) - 4:
+            if data[i:i+4] == START4:
+                start = i + 4; i += 4
+            elif data[i:i+3] == START3:
+                start = i + 3; i += 3
+            else:
+                i += 1; continue
+            if start >= len(data):
+                break
+            if (data[start] >> 1) & 0x3F == nal_type:
+                end = len(data)
+                j = start + 1
+                while j < len(data) - 3:
+                    if data[j:j+4] == START4 or data[j:j+3] == START3:
+                        end = j; break
+                    j += 1
+                return data[start:end]
+            i = start
+        return b""

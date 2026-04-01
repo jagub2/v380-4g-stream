@@ -1,98 +1,192 @@
-# V380 4G Stream
+# v380-4g-stream
 
-Download and decrypt live video streams from V380 (Macro Video) 4G cameras via cloud servers, and optionally re-broadcasts as a local RTSP stream. Suitable for V380 4G cameras where local LAN streaming via RTSP is not possible.
+Record and decrypt live video from V380 (Macro Video) 4G cameras via the
+cloud relay infrastructure. Designed for cameras where local LAN streaming
+is not an option. Also polls the V380 cloud for motion/AI alarm events and
+downloads the associated short clips.
 
 ## Features
 
-- Download encrypted video streams from V380 4G cameras
-- Automatic decryption of H.265 video and AAC audio
-- Direct MP4 output (no ffmpeg required)
-- Local RTSP server for live viewing in VLC
-- Cross-platform (Python 3.7+)
+- Continuous dashcam-style recording to rolling MP4 segments
+- Automatic H.265 decryption and MP4 muxing (ffmpeg if available, pure Python fallback)
+- Alarm-triggered recording: starts a live session instantly when motion is detected
+- Cloud alarm clip download (short clips attached to each alarm event)
+- RTSP server for live viewing in VLC or Home Assistant
+- Auto-discovery of the closest regional streaming server
+- No proprietary SDK — all protocols reverse-engineered from the official app
 
 ## Installation
 
 ```bash
-pip install pycryptodome
+pip install pycryptodome requests
 ```
+
+ffmpeg is optional but recommended for reliable MP4 output:
+```bash
+# Arch/Manjaro
+sudo pacman -S ffmpeg
+```
+
+Python 3.10+ required (uses `match`-free code, but `X | Y` type hints).
+
+## Credentials
+
+Two sets of credentials are used:
+
+**Camera password** (`-p` / `--password`)
+The device password printed on the camera label or set in the V380 Pro app.
+Used for the direct camera TCP connection (`v380_stream.py`).
+
+**Cloud token** (`--alarm-token` / `access_token` in config)
+Required for alarm polling and alarm clip download only. Obtained once via
+Wireshark on the Windows V380 Pro app:
+
+1. Install [Wireshark](https://www.wireshark.org/) and the V380 Pro Windows app
+2. Start capture, filter: `tcp.port == 8002`
+3. Log in to the Windows app
+4. Find `POST /user/pc-login` → copy `access_token` and `user_id` from the response
+5. Find `POST /device/list` → copy `device_id`, base64-decode `device_password`, copy `rand_key`
+
+Using a Windows app token **does not** log out the mobile app — they use
+separate session endpoints (`/user/pc-login` vs `/user/login`).
 
 ## Usage
 
-### Basic Recording
+### Continuous recording
 
 ```bash
-# Record for 60 seconds (default)
+# Record indefinitely, 60s segments (default)
 python v380_stream.py -d DEVICE_ID -p PASSWORD
 
-# Record for 30 seconds
-python v380_stream.py -d DEVICE_ID -p PASSWORD --duration 30
+# 2-minute segments, stop after 1 hour
+python v380_stream.py -d DEVICE_ID -p PASSWORD --segment-mins 2 --total-mins 60
 
-# Record video only (no audio)
-python v380_stream.py -d DEVICE_ID -p PASSWORD --no-audio
+# Auto-discover the lowest-latency regional server
+python v380_stream.py -d DEVICE_ID -p PASSWORD --auto-server
+
+# RTSP live view (open rtsp://localhost:8554/stream in VLC)
+python v380_stream.py -d DEVICE_ID -p PASSWORD --rtsp
 ```
 
-### Live Streaming
+### Alarm-triggered recording
+
+Polls the cloud alarm API in the background. When motion or AI detection
+fires, immediately starts a live recording session for `--record-mins`
+minutes (default 5). If another alarm arrives before the session ends,
+the deadline extends.
 
 ```bash
-# Start RTSP server for live viewing
-python v380_stream.py -d DEVICE_ID -p PASSWORD --rtsp
+# Inline credentials
+python v380_stream.py -d DEVICE_ID -p PASSWORD \
+    --alarm-trigger \
+    --alarm-token ACCESS_TOKEN \
+    --alarm-user-id USER_ID
 
-# Then open in VLC:
-# vlc rtsp://localhost:8554/stream
+# Using a config file
+python v380_stream.py -d DEVICE_ID -p PASSWORD \
+    --alarm-trigger --alarm-config alarm_config.json
+
+# Custom duration (3 minutes per trigger)
+python v380_stream.py -d DEVICE_ID -p PASSWORD \
+    --alarm-trigger --alarm-config alarm_config.json --record-mins 3
 ```
 
-### Options
+`alarm_config.json` example:
+```json
+{
+  "access_token": "cc546d1f...",
+  "user_id": 93643276,
+  "device_id": 104007820,
+  "device_password": "plaintext_camera_password",
+  "output_dir": "recordings",
+  "poll_interval": 15,
+  "alarm_types": [0],
+  "max_clip_age_hours": 24
+}
+```
 
-| Option | Description |
-|--------|-------------|
-| `-d, --device-id` | Camera device ID (from QR code) |
-| `-p, --password` | Device password |
-| `-t, --duration` | Recording duration in seconds (default: 60) |
-| `-o, --output-dir` | Output directory (default: `recordings`) |
-| `--server` | Override API server IP |
-| `--no-audio` | Disable audio recording |
-| `--no-mp4` | Don't convert to MP4 (keeps raw H.265/AAC) |
-| `--keep-raw` | Keep raw H.265/AAC files after MP4 conversion |
-| `--rtsp` | Start RTSP server for live viewing |
-| `--rtsp-port` | RTSP server port (default: 8554) |
-| `--debug` | Enable debug output and raw stream saving |
+### Alarm clip download only
 
-## Output
+Downloads the short cloud clips attached to each alarm event (independent
+of live recording):
 
-The tool automatically creates a `recordings/` directory (configurable with `-o`).
+```bash
+# Run with a config file
+python v380_alarm.py --config alarm_config.json
 
-Output files:
-- `v380_YYYYMMDD_HHMMSS.mp4` - Final MP4 file (video + audio)
-- `v380_YYYYMMDD_HHMMSS.h265` - Raw H.265 video (with `--no-mp4` or `--keep-raw`)
-- `v380_YYYYMMDD_HHMMSS.aac` - Raw AAC audio (with `--no-mp4` or `--keep-raw`)
-- `v380_YYYYMMDD_HHMMSS_raw.bin` - Raw stream data (with `--debug`)
+# Discover devices for a token
+python v380_alarm.py --token ACCESS_TOKEN --devices
 
-Press Ctrl-C to stop recording early.
+# Motion and human detection only
+python v380_alarm.py --config alarm_config.json --motion-only
 
-## Server Configuration
+# Write a config template
+python v380_alarm.py --init
+```
 
-The default API server (`194.195.251.29`) may not work in all regions. V380 uses regional cloud servers. If you experience connection issues, you may need to identify the correct server for your region by capturing traffic from the official V380 Pro app.
+## v380_stream.py options
 
-Use `--server IP` to specify an alternative server.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-d, --device-id` | required | Camera device ID (from QR code or app) |
+| `-p, --password` | required | Camera device password |
+| `-t, --duration` | 60 | Segment duration in seconds |
+| `--segment-mins` | — | Segment duration in minutes (overrides `-t`) |
+| `--total-mins` | — | Stop automatically after this many minutes |
+| `-o, --output-dir` | `recordings` | Output directory |
+| `--server` | — | Override API server IP |
+| `--auto-server` | — | Auto-discover closest server via HTTP dispatch |
+| `--handle` | — | Override AES encryption handle |
+| `--no-audio` | — | Disable audio |
+| `--no-mp4` | — | Keep raw H.265/AAC, skip MP4 conversion |
+| `--keep-raw` | — | Keep raw files alongside MP4 |
+| `--rtsp` | — | Start local RTSP server |
+| `--rtsp-port` | 8554 | RTSP port |
+| `--alarm-trigger` | — | Enable alarm-triggered recording mode |
+| `--alarm-token` | — | Cloud access_token for alarm polling |
+| `--alarm-user-id` | — | Cloud user_id |
+| `--alarm-config` | — | Path to alarm JSON config file |
+| `--record-mins` | 5 | Live recording duration per alarm trigger |
+| `--debug` | — | Verbose logging |
+
+## Output files
+
+```
+recordings/
+  v380_20260101_120000.mp4          continuous recording segments
+  alarm_live_20260101_120000.mp4    alarm-triggered live recording segments
+  alarm_20260101_120000_motion_42.mp4   downloaded alarm cloud clips
+```
+
+## Server discovery
+
+By default the tool connects to a hardcoded relay IP (`194.195.251.29`).
+`--auto-server` queries `dispatch.av380.net:8001/api/v1/get_stream_server`
+with your device ID (signed with SHA-1 + `hsdata2022`) and picks the
+closest regional relay. This typically gives lower latency than the default.
+
+## Project structure
+
+```
+v380_stream.py                  CLI — live recording + alarm-triggered mode
+v380_alarm.py                   CLI — alarm clip download only
+v380_4g/
+├── __init__.py
+├── client.py                   TCP client (connect, auth, discover_stream_server)
+├── crypto.py                   AES key derivation and selective decryption
+├── stream.py                   Live streaming and dashcam segment recording
+├── alarm_recorder.py           Cloud alarm polling and clip download
+├── triggered_recorder.py       Wires AlarmRecorder → StreamRecorder
+├── mp4_muxer.py                Pure Python H.265 → MP4 muxer (ffmpeg fallback)
+└── rtsp_server.py              Local RTSP server for VLC / HA integration
+```
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.10+
 - pycryptodome
-
-## Project Structure
-
-```
-v380_stream.py          # CLI for live streaming
-v380_4g/
-├── __init__.py
-├── client.py           # Core client (connection, auth)
-├── crypto.py           # AES encryption/decryption
-├── stream.py           # Live streaming
-├── mp4_muxer.py        # Pure Python MP4 muxer
-└── rtsp_server.py      # RTSP server for live viewing
-```
-
+- requests
+- ffmpeg (optional, recommended for MP4 output)
 
 ---
 
