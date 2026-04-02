@@ -4,7 +4,7 @@ COPY docker_entrypoint.sh /
 
 COPY requirements.txt ./
 RUN apk add --no-cache --virtual .build-deps gcc g++ make libffi-dev openssl-dev && \
-    apk add --no-cache ca-certificates && \
+    apk add --no-cache ca-certificates ffmpeg && \
     pip install --no-cache-dir -r requirements.txt && \
     apk del .build-deps && \
     addgroup -S v380 && \

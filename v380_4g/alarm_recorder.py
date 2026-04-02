@@ -272,7 +272,8 @@ def get_alarm_list(token: str, device_id: int, device_password: str,
             timeout=15,
         )
         r.raise_for_status()
-        data = r.json()
+        data_b64 = base64.b64decode(r.text)
+        data = json.loads(data_b64)
     except requests.RequestException as e:
         log.error("alarm list failed: %s", e)
         return []
@@ -401,16 +402,18 @@ class AlarmRecorder:
                  poll_interval: int = 15,
                  alarm_types: Optional[list[int]] = None,
                  max_clip_age_hours: int = 24,
+                 on_alarm_callback=None,
                  debug: bool = False):
-        self.token         = access_token
-        self.uid           = int(user_id)
-        self.did           = int(device_id)
-        self.device_pwd    = device_password
-        self.output_dir    = Path(output_dir)
-        self.poll_interval = poll_interval
-        self.alarm_types   = alarm_types or [ALARM_TYPE_ALL]
-        self.max_clip_age  = max_clip_age_hours * 3600
-        self.debug         = debug
+        self.token              = access_token
+        self.uid                = int(user_id)
+        self.did                = int(device_id)
+        self.device_pwd         = device_password
+        self.output_dir         = Path(output_dir)
+        self.poll_interval      = poll_interval
+        self.alarm_types        = alarm_types or [ALARM_TYPE_ALL]
+        self.max_clip_age       = max_clip_age_hours * 3600
+        self.on_alarm_callback  = on_alarm_callback   # callable(alarm: dict) | None
+        self.debug              = debug
 
         if debug:
             log.setLevel(logging.DEBUG)
@@ -433,9 +436,9 @@ class AlarmRecorder:
         """
         Save H.265 data as MP4.
 
-        Tries ffmpeg first (reliable, handles any valid H.265 stream).
+        Tries ffmpeg first (guaranteed correct output for any valid H.265 stream).
         Falls back to the pure-Python MP4Muxer if ffmpeg is not installed.
-        If both fail, saves as raw .h265 playable with: ffplay -f hevc <file>
+        Keeps raw .h265 as last resort, playable with: ffplay -f hevc <file>
         """
         import shutil
         import subprocess
@@ -443,51 +446,38 @@ class AlarmRecorder:
         h265_path = out_path.with_suffix(".h265")
         h265_path.write_bytes(h265_data)
 
-        # --- Try ffmpeg first ---
+        # --- ffmpeg (primary) ---
         if shutil.which("ffmpeg"):
             try:
                 result = subprocess.run(
-                    [
-                        "ffmpeg", "-y",
-                        "-f", "hevc",
-                        "-i", str(h265_path),
-                        "-c:v", "copy",
-                        str(out_path),
-                    ],
-                    capture_output=True,
-                    timeout=60,
+                    ["ffmpeg", "-y", "-f", "hevc", "-i", str(h265_path),
+                     "-c:v", "copy", str(out_path)],
+                    capture_output=True, timeout=60,
                 )
                 if result.returncode == 0:
                     h265_path.unlink()
                     log.info("  saved %s  (%d KB)", out_path.name,
                              len(h265_data) // 1024)
                     return
-                else:
-                    log.warning("  ffmpeg failed (rc=%d): %s",
-                                result.returncode,
-                                result.stderr[-200:].decode(errors="replace"))
+                log.warning("  ffmpeg rc=%d: %s", result.returncode,
+                            result.stderr[-200:].decode(errors="replace"))
             except Exception as e:
                 log.warning("  ffmpeg error: %s", e)
 
-        # --- Fall back to pure-Python MP4Muxer ---
+        # --- pure-Python MP4Muxer (fallback) ---
         log.debug("  falling back to MP4Muxer")
         muxer = MP4Muxer(video_path=str(h265_path), audio_path=None)
-        ok = muxer.mux(str(out_path))
-        if ok:
+        if muxer.mux(str(out_path)):
             try:
                 h265_path.unlink()
             except OSError:
                 pass
-            log.info("  saved %s  (%d KB)", out_path.name,
-                     len(h265_data) // 1024)
+            log.info("  saved %s  (%d KB)", out_path.name, len(h265_data) // 1024)
             return
 
-        # --- Both failed: keep raw .h265 ---
-        log.warning(
-            "  muxing failed — keeping raw H.265: %s  "
-            "Play with: ffplay -f hevc %s",
-            h265_path.name, h265_path.name,
-        )
+        # --- last resort: keep raw .h265 ---
+        log.warning("  muxing failed — keeping %s  (play: ffplay -f hevc %s)",
+                    h265_path.name, h265_path.name)
 
     def _process(self, alarm: dict):
         aid   = alarm.get("id") or alarm.get("aid")
@@ -567,6 +557,14 @@ class AlarmRecorder:
                 if ALARM_TYPE_ALL not in self.alarm_types:
                     if alarm.get("type") not in self.alarm_types:
                         continue
+
+                # Fire callback first so triggered recording starts immediately,
+                # before (potentially slow) cloud clip download begins.
+                if self.on_alarm_callback is not None:
+                    try:
+                        self.on_alarm_callback(alarm)
+                    except Exception as e:
+                        log.exception("[alarm] on_alarm_callback error: %s", e)
 
                 self._process(alarm)
 
