@@ -96,6 +96,9 @@ Press Ctrl-C to stop.
                            help="JSON config file with alarm credentials")
     alarm_grp.add_argument("--record-mins", type=float, default=5.0, metavar="MINS",
                            help="Minutes of live video to record per alarm (default: 5)")
+    alarm_grp.add_argument("--poll-overlap", type=int, default=4, metavar="N",
+                           help="Re-query this many poll intervals into the past each "
+                                "cycle to catch lagged alarms (default: 4)")
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -241,6 +244,7 @@ def _run_alarm_trigger(args, client) -> int:
         poll_interval=alarm_cfg.get("poll_interval", 15),
         alarm_types=alarm_cfg.get("alarm_types", [0]),
         max_clip_age_hours=alarm_cfg.get("max_clip_age_hours", 24),
+        poll_overlap_intervals=alarm_cfg.get("poll_overlap_intervals", args.poll_overlap),
         debug=args.debug,
     )
 

@@ -403,17 +403,23 @@ class AlarmRecorder:
                  alarm_types: Optional[list[int]] = None,
                  max_clip_age_hours: int = 24,
                  on_alarm_callback=None,
+                 poll_overlap_intervals: int = 4,
                  debug: bool = False):
-        self.token              = access_token
-        self.uid                = int(user_id)
-        self.did                = int(device_id)
-        self.device_pwd         = device_password
-        self.output_dir         = Path(output_dir)
-        self.poll_interval      = poll_interval
-        self.alarm_types        = alarm_types or [ALARM_TYPE_ALL]
-        self.max_clip_age       = max_clip_age_hours * 3600
-        self.on_alarm_callback  = on_alarm_callback   # callable(alarm: dict) | None
-        self.debug              = debug
+        self.token                  = access_token
+        self.uid                    = int(user_id)
+        self.did                    = int(device_id)
+        self.device_pwd             = device_password
+        self.output_dir             = Path(output_dir)
+        self.poll_interval          = poll_interval
+        self.alarm_types            = alarm_types or [ALARM_TYPE_ALL]
+        self.max_clip_age           = max_clip_age_hours * 3600
+        self.on_alarm_callback      = on_alarm_callback
+        # When querying, look back this many poll intervals before _last_seen_ms.
+        # Compensates for camera clock drift and server indexing delays — the
+        # alarm may have an itime slightly older than _last_seen_ms even though
+        # it just fired. seen_ids deduplication makes this overlap free.
+        self.poll_overlap_ms        = poll_overlap_intervals * poll_interval * 1000
+        self.debug                  = debug
 
         if debug:
             log.setLevel(logging.DEBUG)
@@ -524,6 +530,10 @@ class AlarmRecorder:
         fetch_types = ([ALARM_TYPE_ALL] if ALARM_TYPE_ALL in self.alarm_types
                        else self.alarm_types)
         newest_ms = self._last_seen_ms
+        # Subtract the overlap window so we re-query a small slice of the
+        # previous period, catching alarms with slightly lagged camera clocks
+        # or delayed server indexing. seen_ids deduplication handles repeats.
+        since_ms = self._last_seen_ms - self.poll_overlap_ms
 
         for atype in fetch_types:
             try:
@@ -531,7 +541,7 @@ class AlarmRecorder:
                     token=self.token,
                     device_id=self.did,
                     device_password=self.device_pwd,
-                    since_ms=self._last_seen_ms,
+                    since_ms=since_ms,
                     alarm_type=atype,
                 )
             except TokenExpiredError as e:
@@ -612,6 +622,7 @@ class AlarmRecorder:
             poll_interval=config.get("poll_interval", 15),
             alarm_types=config.get("alarm_types", [ALARM_TYPE_ALL]),
             max_clip_age_hours=config.get("max_clip_age_hours", 24),
+            poll_overlap_intervals=config.get("poll_overlap_intervals", 4),
             **kwargs,
         )
 

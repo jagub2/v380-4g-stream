@@ -107,6 +107,10 @@ Examples:
                      help="Output directory (default: recordings)")
     rec.add_argument("--poll-interval", type=int, default=15, metavar="SECS",
                      help="Seconds between cloud polls (default: 15)")
+    rec.add_argument("--poll-overlap", type=int, default=4, metavar="N",
+                     help="Re-query this many poll intervals into the past each cycle "
+                          "to catch alarms with lagged camera clocks or delayed server "
+                          "indexing (default: 4 — overlap = 4 × poll_interval seconds)")
     rec.add_argument("--alarm-types", metavar="TYPES", default="0",
                      help="Comma-separated alarm types: 0=all 2=motion 3=PIR "
                           "8=human (default: 0)")
@@ -191,6 +195,7 @@ Examples:
         poll_interval=poll,
         alarm_types=alarm_types,
         max_clip_age_hours=max_age,
+        poll_overlap_intervals=config.get("poll_overlap_intervals", args.poll_overlap),
         debug=args.debug,
     )
 
