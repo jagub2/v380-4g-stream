@@ -25,8 +25,6 @@ DEFAULT_STREAM_PORT = 8800
 
 # HTTP dispatch endpoint — returns streaming relay IPs ordered by proximity.
 # Confirmed from decompiled DispatchUtils.java.
-# POST dispatch.av380.net:8001/api/v1/get_stream_server
-# Response: {"code":2000,"data":[{"ip":"x.x.x.x","domain":"...","tp":{"call_port":N,"trans_port":N}}]}
 _DISPATCH_URL = "http://dispatch.av380.net:8001/api/v1/get_stream_server"
 _DISPATCH_SALT = "hsdata2022"
 
@@ -39,25 +37,17 @@ def discover_stream_server(device_id: int, timeout: int = 5) -> Optional[str]:
     """
     Query the V380 HTTP dispatch server to find the closest streaming relay IP.
 
-    Posts to dispatch.av380.net:8001/api/v1/get_stream_server with the
-    device ID. Returns the first relay IP from the response, or None on failure
-    (caller should fall back to DEFAULT_API_SERVER).
-
-    Signing (from decompiled DispatchUtils.java):
-        canonical = f"dev_id={did}&platform={platform}&timestamp={ts}hsdata2022"
-        sign = SHA1(canonical)
+    Posts to dispatch.av380.net:8001/api/v1/get_stream_server signed with
+    SHA-1 + hsdata2022 salt (from decompiled DispatchUtils.java).
+    Returns the first relay domain/IP, or None on failure.
 
     Usage:
         server = discover_stream_server(device_id) or DEFAULT_API_SERVER
         client = V380Client(device_id, password, server=server)
     """
     ts = int(time.time())
-
-    # platform=10001 for legacy devices (non-IoT), 20001 for IoT.
-    # v380-4g-stream talks to legacy cameras so use 10001.
     platform = 10001
     canonical = f"dev_id={device_id}&platform={platform}&timestamp={ts}{_DISPATCH_SALT}"
-
     payload = json.dumps({
         "dev_id":    device_id,
         "platform":  platform,
@@ -74,19 +64,14 @@ def discover_stream_server(device_id: int, timeout: int = 5) -> Optional[str]:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode()
-
         data = json.loads(body)
         if data.get("code") != 2000:
             return None
-
         entries = data.get("data") or []
         if not entries:
             return None
-
-        # Prefer domain over bare IP (more stable), fall back to IP
         first = entries[0]
         return first.get("domain") or first.get("ip") or None
-
     except Exception:
         return None
 
@@ -104,14 +89,16 @@ class V380Client:
                  api_port: int = DEFAULT_API_PORT,
                  register_port: int = DEFAULT_REGISTER_PORT,
                  stream_port: int = DEFAULT_STREAM_PORT,
+                 hd: bool = False,
                  debug: bool = False):
-        self.device_id = device_id
-        self.password = password
-        self.server = server
-        self.api_port = api_port
+        self.device_id     = device_id
+        self.password      = password
+        self.server        = server
+        self.api_port      = api_port
         self.register_port = register_port
-        self.stream_port = stream_port
-        self.debug = debug
+        self.stream_port   = stream_port
+        self.hd            = hd
+        self.debug         = debug
 
         # Session state
         self.session: Optional[int] = None
@@ -207,6 +194,9 @@ class V380Client:
         random_key = generate_random_key()
         encrypted_pass = encrypt_password(self.password, random_key)
 
+        # accountId and connectType: these are cloud API fields that do NOT
+        # affect stream quality. Quality is set at the stream protocol level
+        # in create_stream_socket() via the quality byte in the 0x12d packet.
         params = {
             "version": 31,
             "phoneType": 1012,
@@ -238,6 +228,7 @@ class V380Client:
             print(f"[+] Login successful!")
             print(f"    Session: {self.session}")
             print(f"    Handle: {self.handle}")
+            print(f"    Quality: {'HD' if self.hd else 'SD'}")
             if self.debug:
                 print(f"    AES Key: {self.aes_key.hex()}")
 
@@ -314,11 +305,24 @@ class V380Client:
             stream_sock.connect((self.server, self.stream_port))
             print(f"[+] Connected to stream port {self.stream_port}")
 
-            # Send device request
+            # Build stream request (0x12d) packet.
+            # Confirmed from Wireshark captures of the Android app (SD vs HD):
+            #   byte 74 (uint32 LE): 0 = SD sub-stream, 1 = HD main stream
+            #   byte 84 (uint32 LE): 0x00000000 = SD, 0x00010000 = HD
+            # Both must be set together for HD to take effect.
+            quality      = 1 if self.hd else 0
+            quality_hi   = 0x00010000 if self.hd else 0x00000000
+
             domain = self.domain.encode().ljust(48, b'\x00')
             packet = struct.pack('<II', 0x012d, 0x03ea) + domain
             packet += struct.pack('<HHH', 0x0000, 0x13ba, 0x0000)
             packet += struct.pack('<III', self.device_id, self.handle, self.session)
+            # Quality fields at bytes 74 and 82 (verified from capture)
+            packet += struct.pack('<I', quality)        # [74:78] HD flag
+            packet += struct.pack('<I', 0x00100015)     # [78:82] constant observed in capture
+            packet += struct.pack('<I', quality_hi)     # [82:86] HD resolution flag
+            packet += struct.pack('<I', 0x01010000)     # [86:90] constant observed in capture
+            packet += struct.pack('<I', 0x00000001)     # [90:94] constant observed in capture
             packet = packet.ljust(256, b'\x00')
             stream_sock.sendall(packet)
 

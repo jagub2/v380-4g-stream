@@ -69,6 +69,11 @@ Press Ctrl-C to stop.
                        help="Auto-discover closest streaming server via HTTP dispatch")
     parser.add_argument("--handle", type=int, metavar="NUM",
                        help="Override encryption handle")
+    parser.add_argument("--hd", action="store_true",
+                       help="Request HD (main) stream instead of SD (sub) stream. "
+                            "Uses accountId=12 and connectType=1 in the login request. "
+                            "Whether HD is actually delivered depends on camera firmware "
+                            "and signal quality.")
     parser.add_argument("--no-audio", action="store_true",
                        help="Disable audio recording")
     parser.add_argument("--no-mp4", action="store_true",
@@ -118,7 +123,7 @@ Press Ctrl-C to stop.
         else:
             print(f"[!] Discovery failed — falling back to {DEFAULT_API_SERVER}")
 
-    client_kwargs = {"debug": args.debug}
+    client_kwargs = {"debug": args.debug, "hd": args.hd}
     if server:
         client_kwargs["server"] = server
 
