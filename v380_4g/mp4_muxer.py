@@ -193,11 +193,125 @@ class MP4Muxer:
         return samples, vps, sps, pps, width, height
 
     def _parse_sps_dimensions(self, sps: bytes) -> tuple:
-        """Parse width/height from SPS (simplified)"""
+        """
+        Parse width/height from an H.265 SPS NALU.
+
+        H.265 SPS dimensions are encoded as:
+            pic_width_in_luma_samples  (ue(v) golomb)
+            pic_height_in_luma_samples (ue(v) golomb)
+        optionally followed by a conformance window that crops the display size.
+
+        The SPS NALU header is 2 bytes (forbidden_zero_bit, nal_unit_type,
+        nuh_layer_id, nuh_temporal_id). The SPS RBSP starts at byte 2.
+        """
         try:
-            return None, None
-        except:
-            return None, None
+            if len(sps) < 4:
+                return None, None
+
+            # Skip 2-byte NALU header
+            rbsp = sps[2:]
+
+            # Bit reader
+            bits = []
+            for byte in rbsp:
+                for shift in range(7, -1, -1):
+                    bits.append((byte >> shift) & 1)
+
+            pos = [0]
+
+            def read_bits(n):
+                val = 0
+                for _ in range(n):
+                    if pos[0] >= len(bits):
+                        return 0
+                    val = (val << 1) | bits[pos[0]]
+                    pos[0] += 1
+                return val
+
+            def read_ue():
+                """Read unsigned Exp-Golomb coded integer."""
+                leading = 0
+                while pos[0] < len(bits) and bits[pos[0]] == 0:
+                    leading += 1
+                    pos[0] += 1
+                pos[0] += 1  # skip the 1 bit
+                if leading == 0:
+                    return 0
+                return (1 << leading) - 1 + read_bits(leading)
+
+            def read_se():
+                """Read signed Exp-Golomb coded integer."""
+                val = read_ue()
+                if val % 2 == 0:
+                    return -(val // 2)
+                return (val + 1) // 2
+
+            # sps_video_parameter_set_id (4 bits)
+            read_bits(4)
+            # sps_max_sub_layers_minus1 (3 bits)
+            max_sub_layers_minus1 = read_bits(3)
+            # sps_temporal_id_nesting_flag (1 bit)
+            read_bits(1)
+
+            # profile_tier_level — fixed structure
+            # general_profile_space(2) + general_tier_flag(1) + general_profile_idc(5)
+            read_bits(8)
+            # general_profile_compatibility_flags (32 bits)
+            read_bits(32)
+            # general_progressive_source_flag, general_interlaced_source_flag,
+            # general_non_packed_constraint_flag, general_frame_only_constraint_flag (4)
+            read_bits(4)
+            # general_reserved_zero_43bits (43) + general_inbld_flag (1)
+            read_bits(44)
+            # general_level_idc (8)
+            read_bits(8)
+            # sub_layer flags + reserved
+            sub_layer_profile_present = []
+            sub_layer_level_present   = []
+            for i in range(max_sub_layers_minus1):
+                sub_layer_profile_present.append(read_bits(1))
+                sub_layer_level_present.append(read_bits(1))
+            if max_sub_layers_minus1 > 0:
+                # reserved_zero_2bits for i in range(max_sub_layers_minus1, 8)
+                read_bits(2 * (8 - max_sub_layers_minus1))
+            # sub_layer profile/level data — AFTER all flags (not interleaved)
+            for i in range(max_sub_layers_minus1):
+                if sub_layer_profile_present[i]:
+                    read_bits(88)   # full sub-layer profile_tier_level
+                if sub_layer_level_present[i]:
+                    read_bits(8)    # sub_layer_level_idc
+
+            # sps_seq_parameter_set_id
+            read_ue()
+            # chroma_format_idc
+            chroma_format_idc = read_ue()
+            if chroma_format_idc == 3:
+                read_bits(1)  # separate_colour_plane_flag
+
+            # THE DIMENSIONS
+            width  = read_ue()
+            height = read_ue()
+
+            # conformance_window_flag — if set, actual display size is smaller
+            conf_win = read_bits(1)
+            if conf_win:
+                # crop offsets in units of 2 luma samples (for 4:2:0)
+                sub_w = 2 if chroma_format_idc in (1, 2) else 1
+                sub_h = 2 if chroma_format_idc == 1 else 1
+                left   = read_ue() * sub_w
+                right  = read_ue() * sub_w
+                top    = read_ue() * sub_h
+                bottom = read_ue() * sub_h
+                width  -= left + right
+                height -= top  + bottom
+
+            if width > 0 and height > 0:
+                return width, height
+
+        except Exception:
+            pass
+
+        return None, None
 
     def _parse_aac(self) -> tuple:
         """Parse raw AAC ADTS stream"""
@@ -485,11 +599,7 @@ class MP4Muxer:
         data.append(0x0F)
         data.append(3)
 
-        # Array type byte: bit7=array_completeness(1), bit6=reserved(0), bits5:0=nal_unit_type
-        # array_completeness=1 (0x80) means all parameter sets are here, none in-band.
-        # Using 0x20 (array_completeness=0) causes strict decoders like mpv to ignore
-        # these arrays and then fail with "VPS/SPS/PPS does not exist".
-        data.append(0x80 | 32)   # VPS
+        data.append(0x80 | 32)   # VPS — array_completeness=1
         data.extend(struct.pack('>H', 1))
         data.extend(struct.pack('>H', len(vps)))
         data.extend(vps)
